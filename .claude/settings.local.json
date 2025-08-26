@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python maintenance_filter.py:*)",
+      "Bash(dir:*)",
+      "Bash(python:*)",
+      "Bash(attrib:*)",
+      "Read(/C:\\Users\\z5183876\\OneDrive - UNSW\\Documents\\GitHub\\PV-syst-data\\Bomen/**)",
+      "Read(/C:\\Users\\z5183876\\OneDrive - UNSW\\Documents\\GitHub\\PV-syst-data\\Bomen/**)",
+      "Read(/C:\\Users\\z5183876\\OneDrive - UNSW\\Documents\\GitHub\\PV-syst-data\\Bomen/**)",
+      "Read(/C:\\Users\\z5183876\\OneDrive - UNSW\\Documents\\GitHub\\PV-syst-data\\Bomen/**)",
+      "Read(/C:\\Users\\z5183876\\OneDrive - UNSW\\Documents\\GitHub\\PV-syst-data\\Data/**)",
+      "Read(/C:\\Users\\z5183876\\OneDrive - UNSW\\Documents\\GitHub\\PV-syst-data\\Data/**)"
+    ]
+  },
+  "outputStyle": "Explanatory"
+}
