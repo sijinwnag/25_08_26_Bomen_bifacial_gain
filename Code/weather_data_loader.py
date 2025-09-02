@@ -46,7 +46,10 @@ class WeatherDataProcessor:
     """
     
     def __init__(self, data_directory: Optional[str] = None, results_directory: Optional[str] = None, 
-                 wind_height_source: float = 3.0):
+                 wind_height_source: float = 3.0, use_csv_ghi: bool = True,
+                 ghi_csv_pattern: str = "Bomen_weather_{year}.csv",
+                 use_csv_temperature: bool = True,
+                 temperature_csv_pattern: str = "Bomen_weather_{year}.csv"):
         """
         Initialize weather data processor.
         
@@ -57,6 +60,14 @@ class WeatherDataProcessor:
                                              Defaults to '../Results' relative to script location.
             wind_height_source (float, optional): Height (in meters) of source wind speed measurements.
                                                  Used for wind speed height conversion to 10m. Defaults to 3.0.
+            use_csv_ghi (bool, optional): Whether to use CSV-based GHI data to replace Excel GHI data.
+                                        Defaults to True for enhanced data quality.
+            ghi_csv_pattern (str, optional): Pattern for CSV GHI files. Use {year} placeholder for year substitution.
+                                           Defaults to "Bomen_weather_{year}.csv".
+            use_csv_temperature (bool, optional): Whether to use CSV-based temperature data to replace Excel temperature data.
+                                                Defaults to True for enhanced data quality.
+            temperature_csv_pattern (str, optional): Pattern for CSV temperature files. Use {year} placeholder for year substitution.
+                                                   Defaults to "Bomen_weather_{year}.csv".
         """
         # Setup data directory
         if data_directory is None:
@@ -78,10 +89,24 @@ class WeatherDataProcessor:
         # Store wind height conversion parameters
         self.wind_height_source = wind_height_source
         
+        # Store GHI CSV replacement parameters
+        self.use_csv_ghi = use_csv_ghi
+        self.ghi_csv_pattern = ghi_csv_pattern
+        
+        # Store temperature CSV replacement parameters
+        self.use_csv_temperature = use_csv_temperature
+        self.temperature_csv_pattern = temperature_csv_pattern
+        
         logger.info(f"Data directory: {self.data_directory}")
         logger.info(f"Results directory: {self.results_directory}")
         logger.info(f"Weather data file: {self.weather_data_path}")
         logger.info(f"Wind height source: {self.wind_height_source}m (will convert to 10m using power law)")
+        logger.info(f"CSV GHI replacement: {'Enabled' if self.use_csv_ghi else 'Disabled'}")
+        if self.use_csv_ghi:
+            logger.info(f"GHI CSV pattern: {self.ghi_csv_pattern}")
+        logger.info(f"CSV temperature replacement: {'Enabled' if self.use_csv_temperature else 'Disabled'}")
+        if self.use_csv_temperature:
+            logger.info(f"Temperature CSV pattern: {self.temperature_csv_pattern}")
         
         # Validate weather data file exists
         if not self.weather_data_path.exists():
@@ -309,15 +334,484 @@ class WeatherDataProcessor:
         logger.info("Wind speed height conversion completed successfully")
         return result_df
     
-    def calculate_station_medians(self, df: pd.DataFrame) -> pd.DataFrame:
+    def load_temperature_from_csv(self, year: int = 2022) -> pd.DataFrame:
+        """
+        Load temperature data from year-specific CSV file.
+        
+        Args:
+            year (int, optional): Year for temperature data loading. Defaults to 2022.
+            
+        Returns:
+            pd.DataFrame: Temperature data with datetime index and standardized column name
+            
+        Raises:
+            FileNotFoundError: If year-specific CSV file doesn't exist
+            ValueError: If temperature column not found or data quality issues detected
+        """
+        logger.info(f"Loading temperature data from CSV for year {year}...")
+        
+        try:
+            # Construct CSV file path using pattern
+            csv_filename = self.temperature_csv_pattern.format(year=year)
+            csv_path = self.data_directory / csv_filename
+            
+            # Validate CSV file exists
+            if not csv_path.exists():
+                raise FileNotFoundError(f"Temperature CSV file not found: {csv_path}")
+            
+            # Load CSV file
+            temp_df = pd.read_csv(csv_path)
+            logger.info(f"Loaded temperature CSV with {len(temp_df)} rows and {len(temp_df.columns)} columns")
+            
+            # Validate required columns exist
+            required_columns = ['date_time', 'Air Temperature mean (Avg )']
+            missing_columns = [col for col in required_columns if col not in temp_df.columns]
+            if missing_columns:
+                raise ValueError(f"Required temperature columns missing: {missing_columns}")
+            
+            # Convert datetime column to datetime index
+            temp_df['date_time'] = pd.to_datetime(temp_df['date_time'])
+            temp_df = temp_df.set_index('date_time')
+            temp_df.index.name = 'Timestamp'
+            
+            # Extract only temperature column for merging
+            temperature_column = temp_df[['Air Temperature mean (Avg )']]
+            
+            # Physical validation of temperature data
+            temp_values = temperature_column['Air Temperature mean (Avg )']
+            temp_stats = {
+                'count': len(temp_values),
+                'min_value': temp_values.min(),
+                'max_value': temp_values.max(),
+                'unrealistic_low_count': (temp_values < -40).sum(),  # °C limit for temperature
+                'unrealistic_high_count': (temp_values > 50).sum(),  # °C limit for temperature
+                'valid_data_percentage': (temp_values.notna().sum() / len(temp_values)) * 100
+            }
+            
+            logger.info(f"Temperature data statistics:")
+            logger.info(f"  Data period: {temperature_column.index.min()} to {temperature_column.index.max()}")
+            logger.info(f"  Value range: {temp_stats['min_value']:.2f} to {temp_stats['max_value']:.2f} °C")
+            logger.info(f"  Unrealistic low values: {temp_stats['unrealistic_low_count']:,} (<-40°C)")
+            logger.info(f"  Unrealistic high values: {temp_stats['unrealistic_high_count']:,} (>50°C)")
+            logger.info(f"  Valid data: {temp_stats['valid_data_percentage']:.1f}%")
+            
+            # Warning for data quality issues
+            if temp_stats['unrealistic_low_count'] > 0:
+                logger.warning(f"Found {temp_stats['unrealistic_low_count']} unrealistically low temperature values (<-40°C)")
+            
+            if temp_stats['unrealistic_high_count'] > 0:
+                logger.warning(f"Found {temp_stats['unrealistic_high_count']} unrealistically high temperature values (>50°C)")
+            
+            logger.info("Temperature CSV loading completed successfully")
+            return temperature_column
+            
+        except Exception as e:
+            logger.error(f"Error loading temperature data from CSV: {e}")
+            raise
+    
+    def replace_temperature_data(self, main_df: pd.DataFrame, temp_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Replace existing temperature columns with CSV-based temperature data using timestamp alignment.
+        
+        Args:
+            main_df (pd.DataFrame): Main weather DataFrame with existing temperature columns
+            temp_df (pd.DataFrame): Temperature data from CSV with datetime index
+            
+        Returns:
+            pd.DataFrame: Enhanced DataFrame with CSV-based temperature replacing multi-station temperature
+        """
+        logger.info("Replacing multi-station temperature data with CSV-based temperature...")
+        
+        try:
+            # Create copy to avoid modifying original
+            result_df = main_df.copy()
+            
+            # Identify and remove existing temperature columns (CP01, CP02, CP03 variants)
+            temp_columns_to_remove = []
+            for col in result_df.columns:
+                if 'Air Temperature' in col and ('CP01' in col or 'CP02' in col or 'CP03' in col):
+                    temp_columns_to_remove.append(col)
+            
+            if temp_columns_to_remove:
+                logger.info(f"Removing existing temperature columns: {temp_columns_to_remove}")
+                result_df = result_df.drop(columns=temp_columns_to_remove)
+            else:
+                logger.warning("No existing multi-station temperature columns found to remove")
+            
+            # Align timestamps and merge temperature data (left join to preserve main_df structure)
+            merged_df = result_df.join(temp_df, how='left')
+            
+            # Check timestamp alignment quality
+            temp_column_name = 'Air Temperature mean (Avg )'
+            overlap_count = merged_df[temp_column_name].notna().sum()
+            total_count = len(merged_df)
+            overlap_ratio = overlap_count / total_count if total_count > 0 else 0
+            
+            logger.info(f"Timestamp alignment results:")
+            logger.info(f"  Total timestamps: {total_count:,}")
+            logger.info(f"  Successful alignments: {overlap_count:,}")
+            logger.info(f"  Alignment ratio: {overlap_ratio:.1%}")
+            
+            if overlap_ratio < 0.8:  # Less than 80% overlap
+                logger.warning(f"Low timestamp overlap ratio: {overlap_ratio:.1%}")
+                logger.warning("Consider checking data date ranges or time resolution compatibility")
+            
+            # Handle missing temperature data with forward fill (limited to reasonable gaps)
+            if merged_df[temp_column_name].isna().any():
+                missing_before = merged_df[temp_column_name].isna().sum()
+                merged_df[temp_column_name] = merged_df[temp_column_name].fillna(method='ffill', limit=12)  # Max 1 hour gap
+                missing_after = merged_df[temp_column_name].isna().sum()
+                filled_count = missing_before - missing_after
+                
+                if filled_count > 0:
+                    logger.info(f"Forward-filled {filled_count} missing temperature values (limited to 1-hour gaps)")
+                if missing_after > 0:
+                    logger.warning(f"Remaining missing temperature values: {missing_after}")
+            
+            logger.info("Temperature data replacement completed successfully")
+            return merged_df
+            
+        except Exception as e:
+            logger.error(f"Error replacing temperature data: {e}")
+            raise
+    
+    def validate_temperature_integration(self, df_before: pd.DataFrame, df_after: pd.DataFrame) -> Dict:
+        """
+        Validate temperature data integration with comprehensive checks.
+        
+        Args:
+            df_before (pd.DataFrame): DataFrame before temperature replacement
+            df_after (pd.DataFrame): DataFrame after temperature replacement
+            
+        Returns:
+            Dict: Comprehensive validation report with metrics and recommendations
+        """
+        logger.info("Validating temperature data integration...")
+        
+        validation_report = {
+            'data_integrity': {},
+            'temperature_replacement': {},
+            'physical_validation': {},
+            'recommendations': []
+        }
+        
+        try:
+            # Data integrity validation
+            validation_report['data_integrity'] = {
+                'rows_preserved': len(df_before) == len(df_after),
+                'index_alignment': df_before.index.equals(df_after.index),
+                'row_count_before': len(df_before),
+                'row_count_after': len(df_after)
+            }
+            
+            # Temperature column replacement validation
+            temp_cols_before = [col for col in df_before.columns if 'Air Temperature' in col]
+            temp_cols_after = [col for col in df_after.columns if 'Air Temperature' in col]
+            
+            validation_report['temperature_replacement'] = {
+                'temperature_columns_before': temp_cols_before,
+                'temperature_columns_after': temp_cols_after,
+                'multi_station_removed': len([col for col in temp_cols_before if 'CP0' in col]) > 0,
+                'csv_temperature_added': 'Air Temperature mean (Avg )' in temp_cols_after
+            }
+            
+            # Physical validation of new temperature data
+            if 'Air Temperature mean (Avg )' in df_after.columns:
+                temp_values = df_after['Air Temperature mean (Avg )']
+                validation_report['physical_validation'] = {
+                    'min_value': float(temp_values.min()),
+                    'max_value': float(temp_values.max()),
+                    'unrealistic_low_count': int((temp_values < -40).sum()),
+                    'unrealistic_high_count': int((temp_values > 50).sum()),
+                    'valid_data_percentage': float((temp_values.notna().sum() / len(temp_values)) * 100),
+                    'mean_value': float(temp_values.mean()),
+                    'std_value': float(temp_values.std())
+                }
+            
+            # Generate recommendations
+            recommendations = []
+            
+            if not validation_report['data_integrity']['rows_preserved']:
+                recommendations.append("WARNING: Row count changed during temperature replacement")
+            
+            if validation_report['physical_validation'].get('unrealistic_low_count', 0) > 10:
+                recommendations.append("Consider investigating unrealistically low temperature values (<-40°C)")
+            
+            if validation_report['physical_validation'].get('unrealistic_high_count', 0) > 10:
+                recommendations.append("Consider investigating unrealistically high temperature values (>50°C)")
+            
+            if validation_report['physical_validation'].get('valid_data_percentage', 100) < 95:
+                recommendations.append("Data completeness below 95% - verify CSV data quality")
+            
+            if not recommendations:
+                recommendations.append("Temperature integration validation passed all checks")
+            
+            validation_report['recommendations'] = recommendations
+            
+            # Log validation summary
+            logger.info("Temperature integration validation results:")
+            for category, results in validation_report.items():
+                if category != 'recommendations':
+                    logger.info(f"  {category}: {results}")
+            
+            for rec in recommendations:
+                if "WARNING" in rec:
+                    logger.warning(f"  {rec}")
+                else:
+                    logger.info(f"  {rec}")
+            
+            return validation_report
+            
+        except Exception as e:
+            logger.error(f"Error during temperature integration validation: {e}")
+            validation_report['error'] = str(e)
+            return validation_report
+    
+    def load_ghi_from_csv(self, year: int = 2022) -> pd.DataFrame:
+        """
+        Load GHI data from year-specific CSV file.
+        
+        Args:
+            year (int, optional): Year for GHI data loading. Defaults to 2022.
+            
+        Returns:
+            pd.DataFrame: GHI data with datetime index and standardized column name
+            
+        Raises:
+            FileNotFoundError: If year-specific CSV file doesn't exist
+            ValueError: If GHI column not found or data quality issues detected
+        """
+        logger.info(f"Loading GHI data from CSV for year {year}...")
+        
+        try:
+            # Construct CSV file path using pattern
+            csv_filename = self.ghi_csv_pattern.format(year=year)
+            csv_path = self.data_directory / csv_filename
+            
+            # Validate CSV file exists
+            if not csv_path.exists():
+                raise FileNotFoundError(f"GHI CSV file not found: {csv_path}")
+            
+            # Load CSV file
+            ghi_df = pd.read_csv(csv_path)
+            logger.info(f"Loaded GHI CSV with {len(ghi_df)} rows and {len(ghi_df.columns)} columns")
+            
+            # Validate required columns exist
+            required_columns = ['date_time', 'GHI Irradiance mean (Avg )']
+            missing_columns = [col for col in required_columns if col not in ghi_df.columns]
+            if missing_columns:
+                raise ValueError(f"Required GHI columns missing: {missing_columns}")
+            
+            # Convert datetime column to datetime index
+            ghi_df['date_time'] = pd.to_datetime(ghi_df['date_time'])
+            ghi_df = ghi_df.set_index('date_time')
+            ghi_df.index.name = 'Timestamp'
+            
+            # Extract only GHI column for merging
+            ghi_column = ghi_df[['GHI Irradiance mean (Avg )']]
+            
+            # Physical validation of GHI data
+            ghi_values = ghi_column['GHI Irradiance mean (Avg )']
+            ghi_stats = {
+                'count': len(ghi_values),
+                'min_value': ghi_values.min(),
+                'max_value': ghi_values.max(),
+                'negative_count': (ghi_values < 0).sum(),
+                'unrealistic_high_count': (ghi_values > 1500).sum(),  # W/m² limit for GHI
+                'valid_data_percentage': (ghi_values.notna().sum() / len(ghi_values)) * 100
+            }
+            
+            logger.info(f"GHI data statistics:")
+            logger.info(f"  Data period: {ghi_column.index.min()} to {ghi_column.index.max()}")
+            logger.info(f"  Value range: {ghi_stats['min_value']:.2f} to {ghi_stats['max_value']:.2f} W/m²")
+            logger.info(f"  Negative values: {ghi_stats['negative_count']:,} ({ghi_stats['negative_count']/ghi_stats['count']*100:.1f}%)")
+            logger.info(f"  Valid data: {ghi_stats['valid_data_percentage']:.1f}%")
+            
+            # Warning for data quality issues
+            if ghi_stats['negative_count'] > 0:
+                logger.warning(f"Found {ghi_stats['negative_count']} negative GHI values (nighttime sensor offset)")
+                logger.info("Negative values will be clipped to 0 in processing pipeline")
+            
+            if ghi_stats['unrealistic_high_count'] > 0:
+                logger.warning(f"Found {ghi_stats['unrealistic_high_count']} unrealistically high GHI values (>1500 W/m²)")
+            
+            logger.info("GHI CSV loading completed successfully")
+            return ghi_column
+            
+        except Exception as e:
+            logger.error(f"Error loading GHI data from CSV: {e}")
+            raise
+    
+    def replace_ghi_data(self, main_df: pd.DataFrame, ghi_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Replace existing GHI columns with CSV-based GHI data using timestamp alignment.
+        
+        Args:
+            main_df (pd.DataFrame): Main weather DataFrame with existing GHI columns
+            ghi_df (pd.DataFrame): GHI data from CSV with datetime index
+            
+        Returns:
+            pd.DataFrame: Enhanced DataFrame with CSV-based GHI replacing multi-station GHI
+        """
+        logger.info("Replacing multi-station GHI data with CSV-based GHI...")
+        
+        try:
+            # Create copy to avoid modifying original
+            result_df = main_df.copy()
+            
+            # Identify and remove existing GHI columns (CP01, CP02, CP03 variants)
+            ghi_columns_to_remove = []
+            for col in result_df.columns:
+                if 'GHI' in col and ('CP01' in col or 'CP02' in col or 'CP03' in col):
+                    ghi_columns_to_remove.append(col)
+            
+            if ghi_columns_to_remove:
+                logger.info(f"Removing existing GHI columns: {ghi_columns_to_remove}")
+                result_df = result_df.drop(columns=ghi_columns_to_remove)
+            else:
+                logger.warning("No existing multi-station GHI columns found to remove")
+            
+            # Align timestamps and merge GHI data (left join to preserve main_df structure)
+            merged_df = result_df.join(ghi_df, how='left')
+            
+            # Check timestamp alignment quality
+            ghi_column_name = 'GHI Irradiance mean (Avg )'
+            overlap_count = merged_df[ghi_column_name].notna().sum()
+            total_count = len(merged_df)
+            overlap_ratio = overlap_count / total_count if total_count > 0 else 0
+            
+            logger.info(f"Timestamp alignment results:")
+            logger.info(f"  Total timestamps: {total_count:,}")
+            logger.info(f"  Successful alignments: {overlap_count:,}")
+            logger.info(f"  Alignment ratio: {overlap_ratio:.1%}")
+            
+            if overlap_ratio < 0.8:  # Less than 80% overlap
+                logger.warning(f"Low timestamp overlap ratio: {overlap_ratio:.1%}")
+                logger.warning("Consider checking data date ranges or time resolution compatibility")
+            
+            # Handle missing GHI data with forward fill (limited to reasonable gaps)
+            if merged_df[ghi_column_name].isna().any():
+                missing_before = merged_df[ghi_column_name].isna().sum()
+                merged_df[ghi_column_name] = merged_df[ghi_column_name].fillna(method='ffill', limit=12)  # Max 1 hour gap
+                missing_after = merged_df[ghi_column_name].isna().sum()
+                filled_count = missing_before - missing_after
+                
+                if filled_count > 0:
+                    logger.info(f"Forward-filled {filled_count} missing GHI values (limited to 1-hour gaps)")
+                if missing_after > 0:
+                    logger.warning(f"Remaining missing GHI values: {missing_after}")
+            
+            logger.info("GHI data replacement completed successfully")
+            return merged_df
+            
+        except Exception as e:
+            logger.error(f"Error replacing GHI data: {e}")
+            raise
+    
+    def validate_ghi_integration(self, df_before: pd.DataFrame, df_after: pd.DataFrame) -> Dict:
+        """
+        Validate GHI data integration with comprehensive checks.
+        
+        Args:
+            df_before (pd.DataFrame): DataFrame before GHI replacement
+            df_after (pd.DataFrame): DataFrame after GHI replacement
+            
+        Returns:
+            Dict: Comprehensive validation report with metrics and recommendations
+        """
+        logger.info("Validating GHI data integration...")
+        
+        validation_report = {
+            'data_integrity': {},
+            'ghi_replacement': {},
+            'physical_validation': {},
+            'recommendations': []
+        }
+        
+        try:
+            # Data integrity validation
+            validation_report['data_integrity'] = {
+                'rows_preserved': len(df_before) == len(df_after),
+                'index_alignment': df_before.index.equals(df_after.index),
+                'row_count_before': len(df_before),
+                'row_count_after': len(df_after)
+            }
+            
+            # GHI column replacement validation
+            ghi_cols_before = [col for col in df_before.columns if 'GHI' in col]
+            ghi_cols_after = [col for col in df_after.columns if 'GHI' in col]
+            
+            validation_report['ghi_replacement'] = {
+                'ghi_columns_before': ghi_cols_before,
+                'ghi_columns_after': ghi_cols_after,
+                'multi_station_removed': len([col for col in ghi_cols_before if 'CP0' in col]) > 0,
+                'csv_ghi_added': 'GHI Irradiance mean (Avg )' in ghi_cols_after
+            }
+            
+            # Physical validation of new GHI data
+            if 'GHI Irradiance mean (Avg )' in df_after.columns:
+                ghi_values = df_after['GHI Irradiance mean (Avg )']
+                validation_report['physical_validation'] = {
+                    'min_value': float(ghi_values.min()),
+                    'max_value': float(ghi_values.max()),
+                    'negative_count': int((ghi_values < 0).sum()),
+                    'unrealistic_high_count': int((ghi_values > 1500).sum()),
+                    'valid_data_percentage': float((ghi_values.notna().sum() / len(ghi_values)) * 100),
+                    'mean_value': float(ghi_values.mean()),
+                    'std_value': float(ghi_values.std())
+                }
+            
+            # Generate recommendations
+            recommendations = []
+            
+            if not validation_report['data_integrity']['rows_preserved']:
+                recommendations.append("WARNING: Row count changed during GHI replacement")
+            
+            if validation_report['physical_validation'].get('negative_count', 0) > 100:
+                recommendations.append("Consider investigating high number of negative GHI values")
+            
+            if validation_report['physical_validation'].get('valid_data_percentage', 100) < 95:
+                recommendations.append("Data completeness below 95% - verify CSV data quality")
+            
+            if validation_report['physical_validation'].get('max_value', 0) > 1400:
+                recommendations.append("Very high GHI values detected - verify sensor calibration")
+            
+            if not recommendations:
+                recommendations.append("GHI integration validation passed all checks")
+            
+            validation_report['recommendations'] = recommendations
+            
+            # Log validation summary
+            logger.info("GHI integration validation results:")
+            for category, results in validation_report.items():
+                if category != 'recommendations':
+                    logger.info(f"  {category}: {results}")
+            
+            for rec in recommendations:
+                if "WARNING" in rec:
+                    logger.warning(f"  {rec}")
+                else:
+                    logger.info(f"  {rec}")
+            
+            return validation_report
+            
+        except Exception as e:
+            logger.error(f"Error during GHI integration validation: {e}")
+            validation_report['error'] = str(e)
+            return validation_report
+    
+    def calculate_station_medians(self, df: pd.DataFrame, year: int = 2022) -> pd.DataFrame:
         """
         Calculate median values across weather stations for each parameter.
+        Optionally replaces GHI data with CSV-based data before processing.
         
         Args:
             df (pd.DataFrame): Input DataFrame with weather station data
+            year (int, optional): Year for potential GHI CSV replacement. Defaults to 2022.
             
         Returns:
-            pd.DataFrame: DataFrame with median values and original individual stations removed
+            pd.DataFrame: DataFrame with median values and original individual stations removed,
+                         optionally with CSV-based GHI data replacing multi-station GHI
         """
         logger.info("Calculating median values across weather stations...")
         
@@ -366,6 +860,68 @@ class WeatherDataProcessor:
             result_df = self._convert_wind_speed_to_10m(result_df, wind_speed_columns)
         else:
             logger.info("No wind speed median columns found for height conversion")
+        
+        # Temperature replacement with CSV data (before clipping in processing pipeline)
+        if self.use_csv_temperature:
+            logger.info(f"Attempting temperature replacement from CSV for year {year}...")
+            try:
+                # Store DataFrame before temperature replacement for validation
+                df_before_temp = result_df.copy()
+                
+                # Load temperature data from CSV
+                temp_df = self.load_temperature_from_csv(year)
+                
+                # Replace temperature data with CSV-based data
+                result_df = self.replace_temperature_data(result_df, temp_df)
+                
+                # Validate temperature integration
+                validation_report = self.validate_temperature_integration(df_before_temp, result_df)
+                
+                # Log key validation results
+                if 'error' not in validation_report:
+                    physical_val = validation_report.get('physical_validation', {})
+                    logger.info(f"Temperature replacement successful:")
+                    logger.info(f"  CSV temperature range: {physical_val.get('min_value', 'N/A'):.1f} to {physical_val.get('max_value', 'N/A'):.1f} °C")
+                    logger.info(f"  Data completeness: {physical_val.get('valid_data_percentage', 'N/A'):.1f}%")
+                else:
+                    logger.error(f"Temperature integration validation failed: {validation_report['error']}")
+                    
+            except Exception as e:
+                logger.warning(f"CSV temperature loading failed, using existing multi-station temperature: {e}")
+                logger.info("Processing will continue with original multi-station temperature data")
+        else:
+            logger.info("CSV temperature replacement disabled - using existing multi-station temperature data")
+        
+        # GHI replacement with CSV data (before clipping in processing pipeline)
+        if self.use_csv_ghi:
+            logger.info(f"Attempting GHI replacement from CSV for year {year}...")
+            try:
+                # Store DataFrame before GHI replacement for validation
+                df_before_ghi = result_df.copy()
+                
+                # Load GHI data from CSV
+                ghi_df = self.load_ghi_from_csv(year)
+                
+                # Replace GHI data with CSV-based data
+                result_df = self.replace_ghi_data(result_df, ghi_df)
+                
+                # Validate GHI integration
+                validation_report = self.validate_ghi_integration(df_before_ghi, result_df)
+                
+                # Log key validation results
+                if 'error' not in validation_report:
+                    physical_val = validation_report.get('physical_validation', {})
+                    logger.info(f"GHI replacement successful:")
+                    logger.info(f"  CSV GHI range: {physical_val.get('min_value', 'N/A'):.1f} to {physical_val.get('max_value', 'N/A'):.1f} W/m²")
+                    logger.info(f"  Data completeness: {physical_val.get('valid_data_percentage', 'N/A'):.1f}%")
+                else:
+                    logger.error(f"GHI integration validation failed: {validation_report['error']}")
+                    
+            except Exception as e:
+                logger.warning(f"CSV GHI loading failed, using existing multi-station GHI: {e}")
+                logger.info("Processing will continue with original multi-station GHI data")
+        else:
+            logger.info("CSV GHI replacement disabled - using existing multi-station GHI data")
         
         logger.info(f"Final DataFrame: {len(result_df)} rows, {len(result_df.columns)} columns")
         logger.info("Median calculation completed successfully")
@@ -430,11 +986,11 @@ class WeatherDataProcessor:
                     end_year = df.index.max().year
                     
                     if start_year == end_year:
-                        filename = f"weather_data_median_{start_year}.csv"
+                        filename = f"PVsyst_weather_{start_year}.csv"
                     else:
-                        filename = f"weather_data_median_{start_year}_to_{end_year}.csv"
+                        filename = f"PVsyst_weather_{start_year}_to_{end_year}.csv"
                 else:
-                    filename = "weather_data_median_empty.csv"
+                    filename = "PVsyst_weather_empty.csv"
             
             # Ensure filename has .csv extension
             if not filename.endswith('.csv'):
@@ -503,14 +1059,47 @@ class WeatherDataProcessor:
         # Step 1: Load data
         df = self.load_weather_data_csv()
         
-        # Step 2: Calculate medians
-        df_with_medians = self.calculate_station_medians(df)
+        # Step 2: Calculate medians (with optional GHI CSV replacement)
+        df_with_medians = self.calculate_station_medians(df, year)
         
         # Step 3: Filter by year
         df_filtered = self.filter_by_year(df_with_medians, year)
 
         # Add a clipping to ensure all values are above or equal to zero
         df_filtered = df_filtered.clip(lower=0)
+
+        # Step 3.5: Fill gaps in GHI data with median values
+        ghi_main_col = 'GHI Irradiance mean (Avg )'
+        ghi_median_col = 'GHI Irradiance mean (Avg )_median'
+        
+        if ghi_main_col in df_filtered.columns and ghi_median_col in df_filtered.columns:
+            # Count missing values before gap filling
+            missing_count_before = df_filtered[ghi_main_col].isna().sum()
+            
+            if missing_count_before > 0:
+                logger.info(f"Filling {missing_count_before:,} missing values in '{ghi_main_col}' with '{ghi_median_col}' data...")
+                
+                # Fill missing values in main GHI column with median column values
+                df_filtered[ghi_main_col] = df_filtered[ghi_main_col].fillna(df_filtered[ghi_median_col])
+                
+                # Count remaining missing values after gap filling
+                missing_count_after = df_filtered[ghi_main_col].isna().sum()
+                filled_count = missing_count_before - missing_count_after
+                
+                logger.info(f"Successfully filled {filled_count:,} gaps in GHI data using median values")
+                if missing_count_after > 0:
+                    logger.warning(f"Remaining missing GHI values: {missing_count_after:,} (median data also missing)")
+                
+                # Validate filled data
+                filled_data_stats = df_filtered[ghi_main_col].dropna()
+                if len(filled_data_stats) > 0:
+                    logger.info(f"GHI data after gap filling: range {filled_data_stats.min():.2f} to {filled_data_stats.max():.2f} W/m²")
+            else:
+                logger.info(f"No missing values found in '{ghi_main_col}' - gap filling not needed")
+        elif ghi_main_col not in df_filtered.columns:
+            logger.warning(f"Main GHI column '{ghi_main_col}' not found - skipping gap filling")
+        elif ghi_median_col not in df_filtered.columns:
+            logger.warning(f"Median GHI column '{ghi_median_col}' not found - skipping gap filling")
 
         # Step 4: Export
         export_path = self.export_to_csv(df_filtered)
@@ -560,7 +1149,7 @@ def load_processed_weather_data(year: int = 2022, data_directory: Optional[str] 
     """
     processor = WeatherDataProcessor(data_directory, wind_height_source=wind_height_source)
     df = processor.load_weather_data_csv()
-    df_with_medians = processor.calculate_station_medians(df)
+    df_with_medians = processor.calculate_station_medians(df, year)
     df_filtered = processor.filter_by_year(df_with_medians, year)
     return df_filtered
 

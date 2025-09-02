@@ -13,7 +13,9 @@
       "Read(/C:\\Users\\z5183876\\OneDrive - UNSW\\Documents\\GitHub\\PV-syst-data\\Data/**)",
       "Read(/C:\\Users\\z5183876\\OneDrive - UNSW\\Documents\\GitHub\\25_07_23_Bomen_analysis\\Code\\24_10_22_PVlib/**)",
       "mcp__context7__resolve-library-id",
-      "mcp__context7__get-library-docs"
+      "mcp__context7__get-library-docs",
+      "Bash(rm:*)",
+      "Bash(awk:*)"
     ]
   },
   "outputStyle": "Explanatory"
